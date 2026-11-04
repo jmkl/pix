@@ -25,6 +25,8 @@ fn main() -> anyhow::Result<()> {
     event_loop.set_control_flow(ControlFlow::Wait);
 
     let mut app = app::App::new(path, event_loop.create_proxy());
+    // Start decoding now so it overlaps with window and GPU startup.
+    app.prefetch();
     event_loop.run_app(&mut app)?;
     Ok(())
 }

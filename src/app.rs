@@ -29,6 +29,11 @@ pub struct App {
     cursor: (f32, f32),
     panning: bool,
     last_frame: Instant,
+    /// True while consecutive animation frames are being drawn. After idle the
+    /// first frame uses a nominal dt instead of the long gap since the last one.
+    frame_chain: bool,
+    /// Time of the last drag event, for fling velocity.
+    last_move: Instant,
     /// Direction of the last arrow press (+1/-1), used to skip broken files.
     last_dir: isize,
     /// Consecutive undecodable files skipped; stops runaway skipping.
@@ -51,8 +56,24 @@ impl App {
             cursor: (0.0, 0.0),
             panning: false,
             last_frame: Instant::now(),
+            frame_chain: false,
+            last_move: Instant::now(),
             last_dir: 1,
             skips: 0,
+        }
+    }
+
+    /// Scan the folder and start decoding the first image. Called before the
+    /// event loop runs, so decoding overlaps with window and GPU startup.
+    pub fn prefetch(&mut self) {
+        match Navigator::open(&self.start_path) {
+            Ok(nav) => {
+                if let Some(p) = nav.current() {
+                    self.loader.request(p.to_path_buf());
+                }
+                self.navigator = Some(nav);
+            }
+            Err(e) => log::error!("cannot open {}: {e}", self.start_path.display()),
         }
     }
 
@@ -63,9 +84,12 @@ impl App {
     }
 
     fn show(&mut self, image: Arc<Decoded>) {
-        if let Some(r) = &mut self.renderer {
-            r.set_image(&image);
-        }
+        let Some(r) = &mut self.renderer else {
+            // Decoded before the GPU is ready: `resumed` shows it.
+            self.current = Some(image);
+            return;
+        };
+        r.set_image(&image);
         self.viewer.set_image((image.width as f32, image.height as f32));
         self.current = Some(image);
         self.preload_neighbors();
@@ -156,22 +180,22 @@ impl ApplicationHandler for App {
 
         let size = window.inner_size();
         self.viewer.resize((size.width as f32, size.height as f32));
-        let mut renderer = Renderer::new(window.clone()).expect("init renderer");
-        // Present the dim backdrop first, then reveal the window.
-        renderer.draw(self.viewer.uniform(), false);
-        window.set_visible(true);
+        let t0 = Instant::now();
+        let renderer = Renderer::new(window.clone()).expect("init renderer");
+        log::info!("renderer ready in {:?}", t0.elapsed());
         self.renderer = Some(renderer);
-        self.window = Some(window);
+        self.window = Some(window.clone());
 
-        match Navigator::open(&self.start_path) {
-            Ok(nav) => {
-                if let Some(p) = nav.current() {
-                    self.loader.request(p.to_path_buf());
-                }
-                self.navigator = Some(nav);
-            }
-            Err(e) => log::error!("cannot open {}: {e}", self.start_path.display()),
+        // If the image already finished decoding, upload it before the first
+        // frame so the window opens with the image in place.
+        if let Some(img) = self.current.take() {
+            self.show(img);
         }
+        // Present the dim backdrop (and image, if any), then reveal the window.
+        if let Some(r) = &mut self.renderer {
+            r.draw(self.viewer.uniform(), false);
+        }
+        window.set_visible(true);
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -198,7 +222,7 @@ impl ApplicationHandler for App {
                     Key::Named(NamedKey::ArrowLeft) => self.navigate(-1),
                     Key::Character(c) => match c.as_str() {
                         "0" => {
-                            self.viewer.fit();
+                            self.viewer.fit_animated();
                             self.redraw();
                         }
                         "1" => {
@@ -221,7 +245,23 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::MouseInput { state, button, .. } => match (button, state) {
-                (MouseButton::Left, s) => self.panning = s == ElementState::Pressed,
+                (MouseButton::Left, ElementState::Pressed) => {
+                    // Clicking the dimmed backdrop outside the image quits, like Esc.
+                    if self.current.is_some() && !self.viewer.image_contains(self.cursor) {
+                        el.exit();
+                        return;
+                    }
+                    self.panning = true;
+                    self.last_move = Instant::now();
+                    self.viewer.begin_drag();
+                }
+                (MouseButton::Left, ElementState::Released) => {
+                    if self.panning {
+                        self.panning = false;
+                        self.viewer.end_drag(self.last_move.elapsed().as_secs_f32());
+                        self.redraw();
+                    }
+                }
                 (MouseButton::Right, ElementState::Pressed) => {
                     if let Some(img) = &self.current {
                         clipboard::copy_image(img.width, img.height, img.rgba.clone());
@@ -233,7 +273,10 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position: PhysicalPosition { x, y }, .. } => {
                 let new = (x as f32, y as f32);
                 if self.panning {
-                    self.viewer.pan_by(new.0 - self.cursor.0, new.1 - self.cursor.1);
+                    let now = Instant::now();
+                    let dt = (now - self.last_move).as_secs_f32();
+                    self.last_move = now;
+                    self.viewer.drag_by(new.0 - self.cursor.0, new.1 - self.cursor.1, dt);
                     self.redraw();
                 }
                 self.cursor = new;
@@ -241,14 +284,19 @@ impl ApplicationHandler for App {
 
             WindowEvent::RedrawRequested => {
                 let now = Instant::now();
-                let dt = (now - self.last_frame).as_secs_f32().min(0.05);
+                let dt = if self.frame_chain {
+                    (now - self.last_frame).as_secs_f32().min(0.05)
+                } else {
+                    1.0 / 60.0
+                };
                 self.last_frame = now;
 
                 self.viewer.tick(dt);
                 if let Some(r) = &mut self.renderer {
                     r.draw(self.viewer.uniform(), self.viewer.use_nearest());
                 }
-                if self.viewer.is_animating() {
+                self.frame_chain = self.viewer.is_animating();
+                if self.frame_chain {
                     self.redraw();
                 }
             }
