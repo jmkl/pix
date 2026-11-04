@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Pix
+Comment=Minimal fullscreen image viewer
+Exec=pix %f
+Terminal=false
+Categories=Graphics;Viewer;
+MimeType=image/jpeg;image/png;image/gif;image/webp;image/bmp;image/tiff;

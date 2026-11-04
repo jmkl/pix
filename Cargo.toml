@@ -1,0 +1,28 @@
+[package]
+name = "pix"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal fullscreen transparent image viewer"
+
+[dependencies]
+winit = "0.30"
+wgpu = "24"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+image = { version = "0.25.6", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff"] }
+arboard = { version = "3", default-features = false, features = ["image-data"] }
+natord = "1"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+
+# Embeds the icon into pix.exe (see build.rs). Only needed when building on Windows.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = 3
