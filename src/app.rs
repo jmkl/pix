@@ -3,6 +3,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::Instant;
 
 use winit::application::ApplicationHandler;
@@ -22,6 +23,8 @@ pub struct App {
     start_path: PathBuf,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
+    /// wgpu instance being created on a background thread (see `main`).
+    instance: Option<JoinHandle<wgpu::Instance>>,
     viewer: Viewer,
     navigator: Option<Navigator>,
     loader: Loader,
@@ -46,6 +49,7 @@ impl App {
             start_path,
             window: None,
             renderer: None,
+            instance: None,
             viewer: Viewer::new((1.0, 1.0)),
             navigator: None,
             loader: Loader::new(5, move || {
@@ -63,18 +67,35 @@ impl App {
         }
     }
 
-    /// Scan the folder and start decoding the first image. Called before the
-    /// event loop runs, so decoding overlaps with window and GPU startup.
+    pub fn set_instance(&mut self, handle: JoinHandle<wgpu::Instance>) {
+        self.instance = Some(handle);
+    }
+
+    /// Start decoding the first image immediately. Called before the event
+    /// loop runs, so decoding overlaps with window and GPU startup. The folder
+    /// scan is deliberately NOT done here: it is only needed for arrow-key
+    /// navigation, so it runs after the first frame (see `open_navigator`).
     pub fn prefetch(&mut self) {
+        // Same form Navigator uses, so the decoded path matches later lookups.
+        self.start_path = self
+            .start_path
+            .canonicalize()
+            .unwrap_or_else(|_| self.start_path.clone());
+        self.loader.request(self.start_path.clone());
+    }
+
+    /// Scan the image's folder (natural sort) and queue neighbor preloads.
+    /// Idempotent; kept off the startup critical path.
+    fn open_navigator(&mut self) {
+        if self.navigator.is_some() {
+            return;
+        }
+        let t0 = Instant::now();
         match Navigator::open(&self.start_path) {
-            Ok(nav) => {
-                if let Some(p) = nav.current() {
-                    self.loader.request(p.to_path_buf());
-                }
-                self.navigator = Some(nav);
-            }
+            Ok(nav) => self.navigator = Some(nav),
             Err(e) => log::error!("cannot open {}: {e}", self.start_path.display()),
         }
+        log::info!("[{:>4} ms] folder scan in {:?}", crate::ms_since_start(), t0.elapsed());
     }
 
     fn redraw(&self) {
@@ -89,7 +110,15 @@ impl App {
             self.current = Some(image);
             return;
         };
+        let t0 = Instant::now();
         r.set_image(&image);
+        log::info!(
+            "[{:>4} ms] upload {}x{} in {:?}",
+            crate::ms_since_start(),
+            image.width,
+            image.height,
+            t0.elapsed()
+        );
         self.viewer.set_image((image.width as f32, image.height as f32));
         self.current = Some(image);
         self.preload_neighbors();
@@ -99,6 +128,7 @@ impl App {
     fn navigate(&mut self, delta: isize) {
         self.last_dir = delta.signum();
         self.skips = 0;
+        self.open_navigator();
         let Some(nav) = &mut self.navigator else { return };
         let Some(path) = nav.step(delta).map(|p| p.to_path_buf()) else { return };
         if let Some(hit) = self.loader.request(path) {
@@ -112,24 +142,22 @@ impl App {
     fn drain_loader(&mut self) {
         let polled = self.loader.poll();
         for decoded in polled.ready {
-            let wanted = self
-                .navigator
-                .as_ref()
-                .and_then(|n| n.current())
-                .map(|p| p == decoded.path)
-                .unwrap_or(false);
+            // Before the folder scan has run, the only image we want is the
+            // one we were launched with.
+            let wanted = match &self.navigator {
+                Some(n) => n.current().map(|p| p == decoded.path).unwrap_or(false),
+                None => decoded.path == self.start_path,
+            };
             if wanted {
                 self.skips = 0;
                 self.show(decoded);
             }
         }
         for path in polled.failed {
-            let is_current = self
-                .navigator
-                .as_ref()
-                .and_then(|n| n.current())
-                .map(|p| p == path)
-                .unwrap_or(false);
+            let is_current = match &self.navigator {
+                Some(n) => n.current().map(|p| p == path).unwrap_or(false),
+                None => path == self.start_path,
+            };
             if is_current {
                 self.skip_broken();
             }
@@ -139,6 +167,7 @@ impl App {
     /// The file we are pointing at could not be decoded: move on in the
     /// direction the user was going.
     fn skip_broken(&mut self) {
+        self.open_navigator();
         let Some(nav) = &mut self.navigator else { return };
         self.skips += 1;
         if self.skips >= nav.len() {
@@ -176,26 +205,40 @@ impl ApplicationHandler for App {
             // the OS shows a blank (white) window while the GPU is starting.
             .with_visible(false)
             .with_fullscreen(Some(Fullscreen::Borderless(None)));
+        let t0 = Instant::now();
         let window = Arc::new(el.create_window(attrs).expect("create window"));
+        log::info!("[{:>4} ms] window created in {:?}", crate::ms_since_start(), t0.elapsed());
 
         let size = window.inner_size();
         self.viewer.resize((size.width as f32, size.height as f32));
         let t0 = Instant::now();
-        let renderer = Renderer::new(window.clone()).expect("init renderer");
+        let instance = match self.instance.take() {
+            Some(h) => h.join().unwrap_or_else(|_| crate::renderer::create_instance()),
+            None => crate::renderer::create_instance(),
+        };
+        log::info!("[{:>4} ms] wgpu instance ready", crate::ms_since_start());
+        let renderer = Renderer::new(window.clone(), instance).expect("init renderer");
         log::info!("renderer ready in {:?}", t0.elapsed());
+        log::info!("[{:>4} ms] renderer ready", crate::ms_since_start());
         self.renderer = Some(renderer);
         self.window = Some(window.clone());
 
-        // If the image already finished decoding, upload it before the first
-        // frame so the window opens with the image in place.
-        if let Some(img) = self.current.take() {
-            self.show(img);
-        }
+        // Pick up anything decoded while the GPU was starting; the wake event
+        // can't be delivered before the loop runs, so poll the channel here.
+        // This uploads the image (once) so the first frame already has it.
+        self.drain_loader();
         // Present the dim backdrop (and image, if any), then reveal the window.
         if let Some(r) = &mut self.renderer {
+            let t0 = Instant::now();
             r.draw(self.viewer.uniform(), false);
+            log::info!("[{:>4} ms] first frame in {:?}", crate::ms_since_start(), t0.elapsed());
         }
         window.set_visible(true);
+        log::info!("[{:>4} ms] window visible", crate::ms_since_start());
+
+        // Everything below is off the critical path: the image is on screen.
+        self.open_navigator();
+        self.preload_neighbors();
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {

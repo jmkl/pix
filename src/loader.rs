@@ -126,6 +126,8 @@ impl Loader {
 }
 
 fn decode(path: &Path) -> anyhow::Result<Decoded> {
+    use std::time::Instant;
+    let t0 = Instant::now();
     // Open through a decoder so the EXIF orientation can be read, then bake
     // the rotation into the pixels.
     let mut decoder = image::ImageReader::open(path)?.with_guessed_format()?.into_decoder()?;
@@ -144,6 +146,15 @@ fn decode(path: &Path) -> anyhow::Result<Decoded> {
     } else {
         None
     };
+
+    log::info!(
+        "[{:>4} ms] decoded {} ({}x{}) in {:?}",
+        crate::ms_since_start(),
+        path.display(),
+        width,
+        height,
+        t0.elapsed()
+    );
 
     Ok(Decoded {
         path: path.to_path_buf(),

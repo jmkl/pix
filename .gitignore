@@ -3,3 +3,4 @@ Cargo.lock.bak
 /test_image
 zip.nu
 *.zip
+*.patch

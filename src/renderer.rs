@@ -36,9 +36,22 @@ pub struct Renderer {
     image: Option<GpuImage>,
 }
 
+/// Create the wgpu instance (loads the Vulkan/Metal loader and its layers).
+/// This needs no window, so `main` runs it on a thread while the event loop
+/// and window are being created.
+///
+/// Vulkan on Windows/Linux, Metal on macOS. Skipping the other backends keeps
+/// adapter enumeration fast (~150ms on Windows for DX12 alone) and DX12
+/// surfaces can't do the transparent backdrop anyway (Opaque only).
+pub fn create_instance() -> wgpu::Instance {
+    wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::VULKAN | wgpu::Backends::METAL,
+        ..Default::default()
+    })
+}
+
 impl Renderer {
-    pub fn new(window: Arc<Window>) -> anyhow::Result<Self> {
-        let instance = wgpu::Instance::default();
+    pub fn new(window: Arc<Window>, instance: wgpu::Instance) -> anyhow::Result<Self> {
         let surface = instance
             .create_surface(window.clone())
             .context("create surface")?;
@@ -49,6 +62,8 @@ impl Renderer {
             force_fallback_adapter: false,
         }))
         .context("no suitable GPU adapter")?;
+        let info = adapter.get_info();
+        log::info!("adapter {} ({:?})", info.name, info.backend);
 
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
