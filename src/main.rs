@@ -23,9 +23,9 @@
 
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 mod icon;
-use eframe::egui::{self, vec2, Color32, PointerButton, Rect, Sense, Stroke, Vec2};
+use eframe::egui::{self, Color32, PointerButton, Rect, Sense, Stroke, Vec2, vec2};
 use fast_image_resize as fir;
-use image::{metadata::Orientation, DynamicImage, ImageDecoder, ImageFormat, ImageReader};
+use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, metadata::Orientation};
 use memmap2::Mmap;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -236,7 +236,8 @@ fn global_cursor_px() -> Option<egui::Pos2> {
         y: i32,
     }
     #[link(name = "user32")]
-    extern "system" {
+
+    unsafe extern "system" {
         fn GetCursorPos(point: *mut Point) -> i32;
     }
 
