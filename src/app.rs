@@ -7,11 +7,11 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use winit::application::ApplicationHandler;
-use winit::dpi::PhysicalPosition;
+use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
-use winit::window::{Fullscreen, Window, WindowId};
+use winit::window::{Fullscreen, Window, WindowId, WindowLevel};
 
 use crate::clipboard;
 use crate::loader::{Decoded, Loader};
@@ -41,6 +41,8 @@ pub struct App {
     last_dir: isize,
     /// Consecutive undecodable files skipped; stops runaway skipping.
     skips: usize,
+    /// Set while a fullscreen exit is in progress.
+    fullscreen_exit_pending: bool,
 }
 
 impl App {
@@ -64,6 +66,7 @@ impl App {
             last_move: Instant::now(),
             last_dir: 1,
             skips: 0,
+            fullscreen_exit_pending: false,
         }
     }
 
@@ -201,6 +204,7 @@ impl ApplicationHandler for App {
             .with_window_icon(winit::window::Icon::from_rgba(crate::icon::rgba(64), 64, 64).ok())
             .with_decorations(false)
             .with_transparent(true)
+            .with_window_level(WindowLevel::AlwaysOnTop)
             // Stay hidden until the first dimmed frame is presented; otherwise
             // the OS shows a blank (white) window while the GPU is starting.
             .with_visible(false)
@@ -250,10 +254,46 @@ impl ApplicationHandler for App {
                     r.resize(size.width, size.height);
                 }
                 self.viewer.resize((size.width as f32, size.height as f32));
-                // Fullscreen may report its real size after the first image
-                // is shown; refit so it is centered for the final size.
                 if self.current.is_some() {
                     self.viewer.fit();
+                }
+                // When leaving fullscreen, winit keeps the fullscreen bounds
+                // (there is no saved window placement), which leaves an OS
+                // frame around a full-screen-sized window. Shrink and center
+                // it into a normal undecorated window instead.
+                if self.fullscreen_exit_pending {
+                    let window = self.window.clone();
+                    let fullscreen_sized = match &window {
+                        Some(w) => match w.current_monitor() {
+                            Some(m) => {
+                                size.width >= m.size().width * 9 / 10
+                                    && size.height >= m.size().height * 9 / 10
+                            }
+                            None => size.width > 1000,
+                        },
+                        None => size.width > 1000,
+                    };
+                    if fullscreen_sized {
+                        if let Some(window) = window {
+                            let _ = window.request_inner_size(LogicalSize::new(800.0, 600.0));
+                            window.set_decorations(false);
+                            window.set_window_level(WindowLevel::AlwaysOnTop);
+                        }
+                    } else {
+                        self.fullscreen_exit_pending = false;
+                        if let Some(window) = window {
+                            window.set_decorations(false);
+                            window.set_window_level(WindowLevel::AlwaysOnTop);
+                            let outer = window.outer_size();
+                            if let Some(monitor) = window.current_monitor() {
+                                let pos = monitor.position();
+                                let mon_size = monitor.size();
+                                let x = pos.x + (mon_size.width as i32 - outer.width as i32) / 2;
+                                let y = pos.y + (mon_size.height as i32 - outer.height as i32) / 2;
+                                let _ = window.set_outer_position(PhysicalPosition::new(x, y));
+                            }
+                        }
+                    }
                 }
                 self.redraw();
             }
@@ -306,6 +346,24 @@ impl ApplicationHandler for App {
                     }
                 }
                 (MouseButton::Right, ElementState::Pressed) => {
+                    // Right-clicking the dimmed backdrop outside the image exits
+                    // fullscreen instead of copying (or quitting).
+                    if self.current.is_some() && !self.viewer.image_contains(self.cursor) {
+                        let mut exiting = false;
+                        if let Some(window) = &self.window {
+                            if window.fullscreen().is_some() {
+                                exiting = true;
+                                self.fullscreen_exit_pending = true;
+                                window.set_fullscreen(None);
+                                window.set_window_level(WindowLevel::AlwaysOnTop);
+                            }
+                        }
+                        if exiting {
+                            return;
+                        }
+                        // Already windowed: nothing to do.
+                        return;
+                    }
                     if let Some(img) = &self.current {
                         clipboard::copy_image(img.width, img.height, img.rgba.clone());
                     }
