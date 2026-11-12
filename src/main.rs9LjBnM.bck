@@ -1,0 +1,381 @@
+//! Minimal, fast image viewer.
+//!
+//!   * Left mouse drag   -> pan
+//!   * Mouse wheel       -> zoom (centered on the cursor)
+//!   * Right click       -> toggle fullscreen
+//!
+//! Usage: minimal-image-viewer <image-file>
+//!
+//! Speed design (same goals as rust-image-viewer's ARCHITECTURE.md §1):
+//!   * Decoding starts on a worker thread *before* the window/GL context exists,
+//!     so window startup and decode run in parallel.
+//!   * JPEG/PNG/BMP use zune-image (SIMD) over a memory-mapped file; everything
+//!     else falls back to the `image` crate.
+//!   * The GPU-ready pixel buffer is built on the worker, not the UI thread.
+//!   * One resize boundary (`downscale_if_needed`) with fast_image_resize.
+//!   * Nothing repaints unless input or a finished decode asks for it (0% idle CPU).
+
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
+use eframe::egui::{self, Color32, PointerButton, Rect, Sense, Vec2};
+use fast_image_resize as fir;
+use image::{metadata::Orientation, DynamicImage, ImageDecoder, ImageFormat, ImageReader};
+use memmap2::Mmap;
+use std::io::Cursor;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::OnceLock;
+use zune_core::{colorspace::ColorSpace, options::DecoderOptions};
+use zune_image::image::Image as ZuneImage;
+
+/// Largest texture side uploaded to the GPU (bounds VRAM to ~256 MB). Bigger
+/// images are downscaled for display only; layout/zoom use the original size.
+const MAX_TEXTURE_SIDE: u32 = 8192;
+/// Refuse absurd images (decompression bombs) before allocating.
+const MAX_PIXELS: u64 = 400_000_000;
+const MIN_ZOOM: f32 = 0.02;
+const MAX_ZOOM: f32 = 64.0;
+/// Zoom speed: factor = exp(scroll_points * ZOOM_SPEED).
+const ZOOM_SPEED: f32 = 0.0015;
+const BG: Color32 = Color32::from_gray(18);
+
+/// Set once the window exists so the decode thread can wake the UI.
+static CTX: OnceLock<egui::Context> = OnceLock::new();
+
+// ───────────────────────────── decoding ──────────────────────────────
+
+struct Decoded {
+    /// GPU-ready pixels (possibly downscaled to MAX_TEXTURE_SIDE).
+    color: egui::ColorImage,
+    /// Original size in pixels after EXIF rotation.
+    size: (u32, u32),
+}
+
+fn swaps_axes(o: Orientation) -> bool {
+    matches!(
+        o,
+        Orientation::Rotate90
+            | Orientation::Rotate270
+            | Orientation::Rotate90FlipH
+            | Orientation::Rotate270FlipH
+    )
+}
+
+/// Header-only read: (width, height, orientation). Microseconds, no pixel decode.
+fn probe(bytes: &[u8]) -> Option<(u32, u32, Orientation, Option<ImageFormat>)> {
+    let reader = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    let format = reader.format();
+    let mut dec = reader.into_decoder().ok()?;
+    let (w, h) = dec.dimensions();
+    let o = dec.orientation().unwrap_or(Orientation::NoTransforms);
+    Some((w, h, o, format))
+}
+
+/// Fast path: zune-image. Returns (w, h, RGBA bytes).
+fn decode_zune(bytes: &[u8], jpeg: bool, w: u32, h: u32) -> Result<(u32, u32, Vec<u8>), String> {
+    let mut options = DecoderOptions::new_fast()
+        .png_set_decode_animated(false)
+        .set_max_width(w as usize)
+        .set_max_height(h as usize);
+    if jpeg {
+        options = options.jpeg_set_out_colorspace(ColorSpace::RGBA);
+    }
+    let mut img = ZuneImage::read(Cursor::new(bytes), options).map_err(|e| e.to_string())?;
+    img.convert_color(ColorSpace::RGBA)
+        .map_err(|e| e.to_string())?;
+    let (w, h) = img.dimensions();
+    let pixels = img
+        .flatten_to_u8()
+        .into_iter()
+        .next()
+        .ok_or("decoder returned no pixels")?;
+    if pixels.len() != w * h * 4 {
+        return Err("pixel buffer size mismatch".into());
+    }
+    Ok((w as u32, h as u32, pixels))
+}
+
+/// Fallback path: the `image` crate. Returns (w, h, RGBA bytes, has_alpha), orientation applied.
+fn decode_image_crate(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>, bool), String> {
+    let mut dec = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| e.to_string())?
+        .into_decoder()
+        .map_err(|e| e.to_string())?;
+    let o = dec.orientation().unwrap_or(Orientation::NoTransforms);
+    let mut img = DynamicImage::from_decoder(dec).map_err(|e| e.to_string())?;
+    img.apply_orientation(o);
+    let has_alpha = img.color().has_alpha();
+    let rgba = img.into_rgba8();
+    Ok((rgba.width(), rgba.height(), rgba.into_raw(), has_alpha))
+}
+
+/// The single resize boundary: shrink only if the image exceeds the GPU limit.
+fn downscale_if_needed(w: u32, h: u32, rgba: Vec<u8>) -> Result<(u32, u32, Vec<u8>), String> {
+    if w <= MAX_TEXTURE_SIDE && h <= MAX_TEXTURE_SIDE {
+        return Ok((w, h, rgba));
+    }
+    let scale = (MAX_TEXTURE_SIDE as f64 / w as f64).min(MAX_TEXTURE_SIDE as f64 / h as f64);
+    let nw = ((w as f64 * scale).round() as u32).max(1);
+    let nh = ((h as f64 * scale).round() as u32).max(1);
+
+    let src =
+        fir::images::ImageRef::new(w, h, &rgba, fir::PixelType::U8x4).map_err(|e| e.to_string())?;
+    let mut dst = fir::images::Image::new(nw, nh, fir::PixelType::U8x4);
+    let options = fir::ResizeOptions::new()
+        .resize_alg(fir::ResizeAlg::Convolution(fir::FilterType::Bilinear));
+    fir::Resizer::new()
+        .resize(&src, &mut dst, Some(&options))
+        .map_err(|e| e.to_string())?;
+    Ok((nw, nh, dst.into_vec()))
+}
+
+fn decode(path: &Path) -> Result<Decoded, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("Failed to open file: {e}"))?;
+    // SAFETY: the mapping is read-only and owned for the duration of the decode.
+    let mmap = unsafe { Mmap::map(&file) }.map_err(|e| format!("Failed to map file: {e}"))?;
+
+    let (w, h, orientation, format) = probe(&mmap).ok_or("Unsupported or corrupt image")?;
+    if (w as u64) * (h as u64) > MAX_PIXELS {
+        return Err(format!("Image too large ({w}x{h})"));
+    }
+
+    // Fast path for the common formats; any failure falls through to `image`.
+    let zune = match format {
+        Some(ImageFormat::Jpeg) => decode_zune(&mmap, true, w, h).ok().map(|r| (r, false)),
+        Some(ImageFormat::Png) | Some(ImageFormat::Bmp) => {
+            decode_zune(&mmap, false, w, h).ok().map(|r| (r, true))
+        }
+        _ => None,
+    };
+
+    let (w, h, rgba, has_alpha) = match zune {
+        Some(((w, h, mut px), has_alpha)) => {
+            let (mut w, mut h) = (w, h);
+            if !matches!(orientation, Orientation::NoTransforms) {
+                let buf = image::RgbaImage::from_raw(w, h, px).ok_or("bad pixel buffer")?;
+                let mut dynimg = DynamicImage::ImageRgba8(buf);
+                dynimg.apply_orientation(orientation);
+                let out = dynimg.into_rgba8();
+                (w, h) = (out.width(), out.height());
+                px = out.into_raw();
+            }
+            (w, h, px, has_alpha)
+        }
+        None => decode_image_crate(&mmap)?,
+    };
+    drop(mmap);
+
+    let size = (w, h);
+    let (tw, th, rgba) = downscale_if_needed(w, h, rgba)?;
+    let dims = [tw as usize, th as usize];
+    // Opaque images skip the per-pixel premultiply.
+    let color = if has_alpha {
+        egui::ColorImage::from_rgba_unmultiplied(dims, &rgba)
+    } else {
+        egui::ColorImage::from_rgba_premultiplied(dims, &rgba)
+    };
+    Ok(Decoded { color, size })
+}
+
+// ───────────────────────────── viewer ────────────────────────────────
+
+struct ViewerApp {
+    rx: Option<Receiver<Result<Decoded, String>>>,
+    texture: Option<egui::TextureHandle>,
+    /// Original image size in pixels.
+    size: (u32, u32),
+    error: Option<String>,
+    /// Display scale relative to 1 image pixel == 1 screen pixel.
+    zoom: f32,
+    /// Offset of the image center from the viewport center, in points.
+    offset: Vec2,
+    /// While true the image is re-fitted to the window every frame
+    /// (initial state, and after resizing / toggling fullscreen).
+    fitted: bool,
+}
+
+impl ViewerApp {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        rx: Option<Receiver<Result<Decoded, String>>>,
+        error: Option<String>,
+    ) -> Self {
+        // Publish the context first so a decode finishing from now on can wake us.
+        let _ = CTX.set(cc.egui_ctx.clone());
+        Self {
+            rx,
+            texture: None,
+            size: (1, 1),
+            error,
+            zoom: 1.0,
+            offset: Vec2::ZERO,
+            fitted: true,
+        }
+    }
+
+    fn poll_decode(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.rx else { return };
+        match rx.try_recv() {
+            Ok(Ok(d)) => {
+                self.texture =
+                    Some(ctx.load_texture("image", d.color, egui::TextureOptions::LINEAR));
+                self.size = d.size;
+                self.rx = None;
+            }
+            Ok(Err(e)) => {
+                self.error = Some(e);
+                self.rx = None;
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.error = Some("Decoder thread stopped unexpectedly".into());
+                self.rx = None;
+            }
+        }
+    }
+}
+
+impl eframe::App for ViewerApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        BG.to_normalized_gamma_f32()
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        self.poll_decode(ui.ctx());
+
+        egui::CentralPanel::default()
+            .frame(eframe::egui::Frame::NONE)
+            .show(ui, |ui| {
+                let view = ui.max_rect();
+                let response = ui.allocate_rect(view, Sense::click_and_drag());
+
+                // Right click: toggle fullscreen (works while loading, too).
+                if response.secondary_clicked() {
+                    let full = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!full));
+                    self.fitted = true;
+                }
+
+                let Some(texture) = self.texture.clone() else {
+                    if let Some(msg) = &self.error {
+                        ui.painter().text(
+                            view.center(),
+                            egui::Align2::CENTER_CENTER,
+                            msg,
+                            egui::FontId::proportional(16.0),
+                            Color32::LIGHT_GRAY,
+                        );
+                    }
+                    return;
+                };
+
+                // Image size in points at zoom == 1 (1 image px == 1 screen px).
+                let ppp = ctx.pixels_per_point();
+                let base = Vec2::new(self.size.0 as f32, self.size.1 as f32) / ppp;
+                let fit = (view.width() / base.x).min(view.height() / base.y);
+
+                if self.fitted {
+                    self.zoom = fit.clamp(MIN_ZOOM, MAX_ZOOM);
+                    self.offset = Vec2::ZERO;
+                }
+
+                // Left drag: pan.
+                if response.dragged_by(PointerButton::Primary) {
+                    self.offset += response.drag_delta();
+                    self.fitted = false;
+                }
+
+                // Scroll: zoom around the cursor.
+                let scroll = ctx.input(|i| i.smooth_scroll_delta.y);
+                if scroll != 0.0 && response.hovered() {
+                    if let Some(p) = CTX.input(|i| i.pointer.hover_pos()) {
+                        let new_zoom =
+                            (self.zoom * (scroll * ZOOM_SPEED).exp()).clamp(MIN_ZOOM, MAX_ZOOM);
+                        let ratio = new_zoom / self.zoom;
+                        let from_center = p - view.center();
+                        self.offset = from_center - (from_center - self.offset) * ratio;
+                        self.zoom = new_zoom;
+                        self.fitted = false;
+                    }
+                }
+
+                let rect = Rect::from_center_size(view.center() + self.offset, base * self.zoom);
+                ui.painter().image(
+                    texture.id(),
+                    rect,
+                    Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            });
+    }
+}
+
+// ────────────────────────────── main ─────────────────────────────────
+
+/// Window size from the header alone, scaled to fit 1280x800 keeping aspect.
+fn initial_window_size(path: &Path) -> [f32; 2] {
+    let dims = std::fs::File::open(path)
+        .ok()
+        .and_then(|f| unsafe { Mmap::map(&f) }.ok())
+        .and_then(|m| probe(&m))
+        .map(|(w, h, o, _)| if swaps_axes(o) { (h, w) } else { (w, h) });
+    match dims {
+        Some((w, h)) if w > 0 && h > 0 => {
+            let (w, h) = (w as f32, h as f32);
+            let s = (1280.0 / w).min(800.0 / h).min(1.0);
+            [(w * s).max(240.0), (h * s).max(240.0)]
+        }
+        _ => [800.0, 600.0],
+    }
+}
+
+fn main() -> eframe::Result<()> {
+    let path = std::env::args_os().nth(1).map(PathBuf::from);
+
+    // Start decoding immediately; it overlaps with window + GL creation below.
+    let (rx, error) = match &path {
+        Some(p) => {
+            let (tx, rx) = mpsc::channel();
+            let p = p.clone();
+            std::thread::spawn(move || {
+                let result = decode(&p).map_err(|e| format!("Failed to open {}: {e}", p.display()));
+                let _ = tx.send(result);
+                if let Some(ctx) = CTX.get() {
+                    ctx.request_repaint();
+                }
+            });
+            (Some(rx), None)
+        }
+        None => (
+            None,
+            Some("Usage: minimal-image-viewer <image-file>".to_string()),
+        ),
+    };
+
+    let title = path
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Image Viewer".into());
+    let inner = path
+        .as_deref()
+        .map(initial_window_size)
+        .unwrap_or([640.0, 360.0]);
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title(title.clone())
+            .with_inner_size(inner),
+        renderer: eframe::Renderer::Glow,
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        &title,
+        options,
+        Box::new(move |cc| Ok(Box::new(ViewerApp::new(cc, rx, error)))),
+    )
+}

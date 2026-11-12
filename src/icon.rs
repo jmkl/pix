@@ -1,3 +1,4 @@
+
 //! Procedural app icon, shared by the window (runtime) and `build.rs` (the
 //! .exe icon), so there is a single source of truth and no binary asset.
 //! Only depends on `std`.
